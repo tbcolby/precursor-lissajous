@@ -1,271 +1,238 @@
-//! State machine for Lissajous Machine.
-//!
-//! States:
-//!   Menu      — choose frequency ratio, phase, amplitude
-//!   Drawing   — live curve rendering
-//!   Gallery   — preset patterns
-//!   Table     — frequency ratio grid showing pattern shapes
+//! Lissajous shell: keys -> core operations, drawing, nothing else. The curve
+//! maths, presets and the incremental tracer are in `lissajous-core`.
 
-extern crate alloc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::format;
+use gam::menu::Point;
+use gam::GlyphStyle;
+use lissajous_core::{thumbnail, Curve, Params, Tracer, FREQ_MAX, PRESETS, SEGMENTS_PER_TICK};
+use precursor_appkit::keys::Key;
+use precursor_appkit::layout::ListState;
+use precursor_appkit::screen::{Screen, MARGIN};
 
-use crate::math;
+#[derive(PartialEq, Eq)]
+pub enum Action {
+    Stay,
+    Leave,
+}
 
-const KEY_UP: char = '\u{F700}';
-const KEY_DOWN: char = '\u{F701}';
-const KEY_LEFT: char = '\u{F702}';
-const KEY_RIGHT: char = '\u{F703}';
-const KEY_ENTER: char = '\u{000D}';
-const KEY_BACKSPACE: char = '\u{0008}';
-const KEY_MENU: char = '\u{2234}';
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AppState {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
     Menu,
     Drawing,
     Gallery,
     Table,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MenuField {
-    FreqA,
-    FreqB,
-    Phase,
-    Draw,
-    Gallery,
-    Table,
+const MENU_ROWS: usize = 6;
+const ROW_DRAW: usize = 3;
+const ROW_GALLERY: usize = 4;
+const ROW_TABLE: usize = 5;
+
+pub struct App {
+    screen: Screen,
+    view: View,
+    params: Params,
+    menu: ListState,
+    gallery: ListState,
+    visible: usize,
+    /// Ratio table cursor: column = x frequency - 1, row = y frequency - 1.
+    cell: (i32, i32),
+    tracer: Tracer,
 }
 
-/// A preset Lissajous pattern.
-#[derive(Debug, Clone, Copy)]
-pub struct Preset {
-    pub name: &'static str,
-    pub freq_a: i32,
-    pub freq_b: i32,
-    pub phase: i32,  // in 1/1024 units (256 = π/2)
-}
-
-pub const PRESETS: &[Preset] = &[
-    Preset { name: "Circle",         freq_a: 1, freq_b: 1, phase: 256 },
-    Preset { name: "Figure-8",       freq_a: 1, freq_b: 2, phase: 0 },
-    Preset { name: "Bowtie",         freq_a: 2, freq_b: 3, phase: 0 },
-    Preset { name: "Trefoil",        freq_a: 3, freq_b: 2, phase: 256 },
-    Preset { name: "Clover",         freq_a: 3, freq_b: 4, phase: 0 },
-    Preset { name: "Star Knot",      freq_a: 5, freq_b: 4, phase: 256 },
-    Preset { name: "Diamond",        freq_a: 1, freq_b: 2, phase: 256 },
-    Preset { name: "Infinity",       freq_a: 2, freq_b: 1, phase: 256 },
-    Preset { name: "Ribbon",         freq_a: 3, freq_b: 5, phase: 128 },
-    Preset { name: "Atomic",         freq_a: 5, freq_b: 6, phase: 0 },
-];
-
-pub struct LissajousApp {
-    pub state: AppState,
-    pub needs_redraw: bool,
-
-    // Menu
-    pub menu_field: MenuField,
-    pub freq_a: i32,
-    pub freq_b: i32,
-    pub phase: i32,     // in 1/1024 units (256 = π/2)
-
-    // Drawing - precomputed points
-    pub points: Vec<(i16, i16)>,
-
-    // Gallery
-    pub gallery_cursor: usize,
-
-    // Table
-    pub table_row: usize,
-    pub table_col: usize,
-}
-
-impl LissajousApp {
-    pub fn new() -> Self {
-        Self {
-            state: AppState::Menu,
-            needs_redraw: true,
-            menu_field: MenuField::FreqA,
-            freq_a: 1,
-            freq_b: 2,
-            phase: 0,
-            points: Vec::new(),
-            gallery_cursor: 0,
-            table_row: 0,
-            table_col: 0,
-        }
+impl App {
+    pub fn new(screen: Screen) -> Self {
+        let params = PRESETS[1].params;
+        let mut app = Self {
+            screen,
+            view: View::Menu,
+            params,
+            menu: ListState::default(),
+            gallery: ListState::default(),
+            visible: 1,
+            cell: (params.a - 1, params.b - 1),
+            tracer: Tracer::new(Curve::new(params, (0, 0), (1, 1))),
+        };
+        app.restart();
+        app
     }
 
-    fn compute_curve(&mut self) {
-        self.compute_curve_params(self.freq_a, self.freq_b, self.phase);
+    pub fn screen(&self) -> &Screen { &self.screen }
+
+    /// True while the pen is still moving (the pump runs only then).
+    pub fn animating(&self) -> bool { self.view == View::Drawing && !self.tracer.done() }
+
+    /// Content area between header and footer, matching `Screen::header`/`footer`.
+    fn content(&self) -> (isize, isize) {
+        let top = 2 + self.screen.line_height(GlyphStyle::Bold) + 2 + 4;
+        let bottom = self.screen.size().y - self.screen.line_height(GlyphStyle::Small) - 2 - 4;
+        (top, bottom)
     }
 
-    fn compute_curve_params(&mut self, fa: i32, fb: i32, ph: i32) {
-        self.points.clear();
-        // Period: LCM(fa, fb) full cycles at 1024 steps per cycle
-        let period = math::lcm(fa, fb);
-        let total_steps = (period * 1024).min(16384);
-
-        let cx: i16 = 168; // center x
-        let cy: i16 = 260; // center y
-
-        let amp = 140i32; // pixel amplitude
-
-        for step in 0..total_steps {
-            let t = step;
-            let x_fp = math::lissajous_x(t, fa, ph, amp);
-            let y_fp = math::lissajous_y(t, fb, amp);
-
-            // Convert from fixed-point to screen coords
-            let sx = cx + (x_fp >> 16) as i16;
-            let sy = cy + (y_fp >> 16) as i16;
-
-            self.points.push((sx, sy));
-        }
+    fn restart(&mut self) {
+        let (top, bottom) = self.content();
+        let w = self.screen.size().x as i32;
+        let amp = ((w - 2 * MARGIN as i32) / 2).min(((bottom - top) as i32) / 2 - 2).max(8);
+        let center = (w / 2, ((top + bottom) / 2) as i32);
+        self.tracer = Tracer::new(Curve::new(self.params, center, (amp, amp)));
     }
 
-    pub fn handle_key(&mut self, key: char) -> bool {
-        self.needs_redraw = true;
-        match self.state {
-            AppState::Menu => self.handle_menu(key),
-            AppState::Drawing => self.handle_drawing(key),
-            AppState::Gallery => self.handle_gallery(key),
-            AppState::Table => self.handle_table(key),
-        }
+    fn start(&mut self, p: Params) {
+        self.params = p;
+        self.cell = (p.a - 1, p.b - 1);
+        self.restart();
+        self.view = View::Drawing;
     }
 
-    fn handle_menu(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU => return false,
-            KEY_UP => {
-                self.menu_field = match self.menu_field {
-                    MenuField::FreqA => MenuField::Table,
-                    MenuField::FreqB => MenuField::FreqA,
-                    MenuField::Phase => MenuField::FreqB,
-                    MenuField::Draw => MenuField::Phase,
-                    MenuField::Gallery => MenuField::Draw,
-                    MenuField::Table => MenuField::Gallery,
-                };
-            }
-            KEY_DOWN => {
-                self.menu_field = match self.menu_field {
-                    MenuField::FreqA => MenuField::FreqB,
-                    MenuField::FreqB => MenuField::Phase,
-                    MenuField::Phase => MenuField::Draw,
-                    MenuField::Draw => MenuField::Gallery,
-                    MenuField::Gallery => MenuField::Table,
-                    MenuField::Table => MenuField::FreqA,
-                };
-            }
-            KEY_LEFT | KEY_RIGHT => {
-                let delta = if key == KEY_RIGHT { 1 } else { -1 };
-                match self.menu_field {
-                    MenuField::FreqA => {
-                        self.freq_a = (self.freq_a + delta).max(1).min(9);
+    pub fn on_key(&mut self, key: Key) -> Action {
+        match self.view {
+            View::Menu => return self.menu_key(key),
+            View::Drawing => match key {
+                Key::Left | Key::Right => {
+                    self.params.step_phase(if key == Key::Left { -1 } else { 1 });
+                    self.restart();
+                }
+                Key::Enter => self.restart(),
+                k if k.is_back() => self.view = View::Menu,
+                _ => {}
+            },
+            View::Gallery => match key {
+                Key::Up => self.gallery.step(-1, PRESETS.len(), self.visible),
+                Key::Down => self.gallery.step(1, PRESETS.len(), self.visible),
+                Key::Enter => self.start(PRESETS[self.gallery.selected].params),
+                k if k.is_back() => self.view = View::Menu,
+                _ => {}
+            },
+            View::Table => {
+                let (c, r) = &mut self.cell;
+                match key {
+                    Key::Left => *c = (*c - 1).max(0),
+                    Key::Right => *c = (*c + 1).min(FREQ_MAX - 1),
+                    Key::Up => *r = (*r - 1).max(0),
+                    Key::Down => *r = (*r + 1).min(FREQ_MAX - 1),
+                    // Keep the user's phase; the ratio is what the table chooses.
+                    Key::Enter => {
+                        let p = Params::new(*c + 1, *r + 1, self.params.phase);
+                        self.start(p);
                     }
-                    MenuField::FreqB => {
-                        self.freq_b = (self.freq_b + delta).max(1).min(9);
-                    }
-                    MenuField::Phase => {
-                        // Step by 64 (≈22.5°)
-                        self.phase = ((self.phase + delta * 64) % 1024 + 1024) % 1024;
-                    }
+                    k if k.is_back() => self.view = View::Menu,
                     _ => {}
                 }
             }
-            KEY_ENTER => match self.menu_field {
-                MenuField::Draw => {
-                    self.compute_curve();
-                    self.state = AppState::Drawing;
+        }
+        Action::Stay
+    }
+
+    fn menu_key(&mut self, key: Key) -> Action {
+        match key {
+            Key::Up => self.menu.step_wrapping(-1, MENU_ROWS, self.visible),
+            Key::Down => self.menu.step_wrapping(1, MENU_ROWS, self.visible),
+            Key::Left | Key::Right => {
+                let d = if key == Key::Left { -1 } else { 1 };
+                match self.menu.selected {
+                    0 => self.params.step_a(d),
+                    1 => self.params.step_b(d),
+                    2 => self.params.step_phase(d),
+                    _ => {}
                 }
-                MenuField::Gallery => {
-                    self.state = AppState::Gallery;
-                }
-                MenuField::Table => {
-                    self.state = AppState::Table;
+            }
+            Key::Enter => match self.menu.selected {
+                ROW_DRAW => self.start(self.params),
+                ROW_GALLERY => self.view = View::Gallery,
+                ROW_TABLE => {
+                    self.cell = (self.params.a - 1, self.params.b - 1);
+                    self.view = View::Table;
                 }
                 _ => {}
             },
+            k if k.is_back() => return Action::Leave,
             _ => {}
         }
-        true
+        Action::Stay
     }
 
-    fn handle_drawing(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT | KEY_ENTER => {
-                self.state = AppState::Menu;
-            }
-            _ => {}
+    pub fn on_foreground(&mut self) {
+        self.screen.refresh_size();
+        if self.view == View::Drawing {
+            self.restart();
         }
-        true
     }
 
-    fn handle_gallery(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT => {
-                self.state = AppState::Menu;
-            }
-            KEY_UP => {
-                if self.gallery_cursor > 0 {
-                    self.gallery_cursor -= 1;
-                }
-            }
-            KEY_DOWN => {
-                if self.gallery_cursor < PRESETS.len() - 1 {
-                    self.gallery_cursor += 1;
-                }
-            }
-            KEY_ENTER => {
-                let preset = PRESETS[self.gallery_cursor];
-                self.freq_a = preset.freq_a;
-                self.freq_b = preset.freq_b;
-                self.phase = preset.phase;
-                self.compute_curve();
-                self.state = AppState::Drawing;
-            }
-            _ => {}
+    /// Reveal the next few segments. Only the new ones are drawn: no clear, no
+    /// redraw of what is already on screen.
+    pub fn on_tick(&mut self) {
+        if self.view != View::Drawing {
+            return;
         }
-        true
+        let range = self.tracer.advance(SEGMENTS_PER_TICK);
+        let clip = self.clip();
+        self.screen.lines(self.tracer.curve.segments(range), clip, 1);
+        self.screen.flush();
     }
 
-    fn handle_table(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT => {
-                self.state = AppState::Menu;
+    fn clip(&self) -> ((i32, i32), (i32, i32)) {
+        let (top, bottom) = self.content();
+        ((0, top as i32), (self.screen.size().x as i32 - 1, bottom as i32))
+    }
+
+    pub fn draw(&mut self) {
+        self.screen.clear();
+        let p = self.params;
+        match self.view {
+            View::Menu => {
+                let top = self.screen.header("Lissajous");
+                let bottom = self.screen.footer("↑↓ field  ←→ change  ⏎ go  ⌫ quit");
+                let items = [
+                    format!("A (x) frequency: {}", p.a),
+                    format!("B (y) frequency: {}", p.b),
+                    format!("Phase: {}°", p.phase_degrees()),
+                    "Draw".to_string(),
+                    "Presets".to_string(),
+                    "Ratio table".to_string(),
+                ];
+                self.visible = self.screen.list(top, bottom, &items, &self.menu);
             }
-            KEY_UP => {
-                if self.table_row > 0 {
-                    self.table_row -= 1;
-                }
+            View::Drawing => {
+                self.screen.header(&format!("{}:{}  phase {}°", p.a, p.b, p.phase_degrees()));
+                self.screen.footer("←→ phase  ⏎ redraw  ⌫ back");
+                let drawn = self.tracer.drawn();
+                self.screen.lines(self.tracer.curve.segments(0..drawn), self.clip(), 1);
             }
-            KEY_DOWN => {
-                if self.table_row < 5 {
-                    self.table_row += 1;
-                }
+            View::Gallery => {
+                let top = self.screen.header("Presets");
+                let bottom = self.screen.footer("↑↓ move  ⏎ draw  ⌫ back");
+                let items: Vec<String> = PRESETS
+                    .iter()
+                    .map(|pr| format!("{}  {}:{}", pr.name, pr.params.a, pr.params.b))
+                    .collect();
+                self.visible = self.screen.list(top, bottom, &items, &self.gallery);
             }
-            KEY_RIGHT => {
-                if self.table_col < 5 {
-                    self.table_col += 1;
-                }
-            }
-            KEY_ENTER => {
-                // Draw the selected ratio
-                self.freq_a = (self.table_col as i32) + 1;
-                self.freq_b = (self.table_row as i32) + 1;
-                self.phase = 256; // π/2 for nice shapes
-                self.compute_curve();
-                self.state = AppState::Drawing;
-            }
-            _ => {}
+            View::Table => self.draw_table(),
         }
-        true
+        self.screen.flush();
     }
 
-    /// Phase in degrees (approx) for display
-    pub fn phase_degrees(&self) -> i32 {
-        self.phase * 360 / 1024
+    fn draw_table(&self) {
+        let (c, r) = self.cell;
+        self.screen.header(&format!("Ratios  x{} : y{}", c + 1, r + 1));
+        let (top, bottom) = self.content();
+        self.screen.footer("arrows move  ⏎ draw  ⌫ back");
+        let w = self.screen.size().x - 2 * MARGIN;
+        let side = (w / FREQ_MAX as isize).min((bottom - top) / FREQ_MAX as isize);
+        let x0 = (self.screen.size().x - side * FREQ_MAX as isize) / 2;
+        let rad = (side / 2 - 3) as i32;
+        let mut segs = Vec::with_capacity((FREQ_MAX * FREQ_MAX) as usize * 64);
+        for row in 0..FREQ_MAX {
+            for col in 0..FREQ_MAX {
+                let center = (
+                    (x0 + col as isize * side + side / 2) as i32,
+                    (top + row as isize * side + side / 2) as i32,
+                );
+                segs.extend(thumbnail(Params::new(col + 1, row + 1, self.params.phase), center, rad).segments(0..64));
+            }
+        }
+        let clip = ((0, top as i32), (self.screen.size().x as i32 - 1, bottom as i32));
+        self.screen.lines(segs, clip, 1);
+        let tl = Point::new(x0 + c as isize * side, top + r as isize * side);
+        self.screen.frame(tl, Point::new(tl.x + side - 1, tl.y + side - 1), 2);
     }
 }

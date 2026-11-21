@@ -1,0 +1,14 @@
+{
+    "lissajous": {
+        "context_name": "Lissajous",
+        "menu_name": {
+            "appmenu.lissajous": {
+                "en": "Lissajous",
+                "en-tts": "Lissajous",
+                "fr": "Lissajous",
+                "ja": "Lissajous",
+                "zh": "Lissajous"
+            }
+        }
+    }
+}
