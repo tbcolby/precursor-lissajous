@@ -1,16 +1,7 @@
-# Lissajous Machine — Build Notes
+# Lissajous build notes
 
-## What This Is
-Parametric Lissajous curve generator for Precursor. Renders x=sin(at+δ), y=sin(bt) patterns.
-
-## Key Decisions
-- **Reuses Spirograph's fixed-point math**: Same 16.16 FP, parabolic sin/cos, 1024 angle units
-- **Ratio table**: Interactive 6×6 grid showing all simple frequency ratios — unique feature
-- **Phase in 1/1024 units**: 256 = π/2 (90°). Steps by 64 in menu (≈22.5°)
-- **LCM for period**: Unlike spirograph's GCD, Lissajous period = LCM(a,b) cycles
-- **No storage**: Pure visual app
-
-## Architecture
-- 4 states: Menu, Drawing, Gallery, Table
-- 10 presets + full ratio table exploration
-- Shared math module pattern with Spirograph
+- Maths in `core/src/lib.rs`: shared `fixed::sin` (Q16.16, 4096 units/turn). A:B is reduced by gcd so the curve closes after one turn (`Curve::len()` segments); step is a power of two so `point(len()) == point(0)` exactly.
+- Points are computed from the index (`Curve::point`), no buffer. `Tracer::advance` returns each segment index once; the shell draws only new segments per pump tick.
+- The pump runs only when foreground and `App::animating()`; `main.rs` re-evaluates after every message.
+- No storage. Back = Backspace/F4; `∴` is never delivered.
+- Tests: `cd core && cargo test`.
